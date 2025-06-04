@@ -1,0 +1,37 @@
+15 12 100 3 3 3 3
+.............o.
+.cc..##........
+.....##........
+..x..##........
+.....##..#####.
+..r..##........
+......r....x...
+.....##........
+..x..##..#####.
+..c..##........
+o.r..##........
+.............o.
+
+c1 1 1
+c2 2 1
+c3 2 9
+r1 2 10
+r2 2 5
+r3 6 6
+x1 2 3 1
+x2 11 6 1
+x3 2 8 1
+o1 13 0
+o2 13 11
+o3 0 10
+
+# Erwartetes Verhalten der Agenten:
+# - CollectAgenten finden Materiallager durch Exploration und verhandeln per CNP Übergabeorte mit RepairAgenten.
+# - Die Agenten sollten in der Lage sein, in den gegebenen Runden alle drei Löcher zu füllen.
+#
+# Getestete Aspekte:
+# - Funktionalität des Contract Net Protocols bei Treffpunktwahl
+# - Explorationseffizienz der CollectAgenten
+# - Navigation um Hindernisse (##)
+# - Navigation bei sehr eingeschränkten Wegoptionen
+# - Auslastungsverteilung zwischen den RepairAgenten und CollectAgenten
