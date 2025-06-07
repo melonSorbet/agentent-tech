@@ -19,252 +19,232 @@ class RepairAgent(private val repairID: String) : Agent(overrideName = repairID)
     private var cnpPartnerId: String? = null
     private var isSubscribed = false
 
+    // State flags for delayed server requests
+    private var meetingPositionForTransfer: Position? = null
+    private var arrivedForTransferWaitingNextTurn = false
+    private var arrivedAtRepairPointWaitingNextTurn = false
+
+    // A mutable list of repair points the agent believes are still open.
+    private var knownOpenRepairPoints: MutableList<Position> = mutableListOf()
+
     override fun behaviour() = act {
         on<GameSetupInfo> { gameSetupInfo ->
             setup = gameSetupInfo
-            log.info("RepairAgent ($repairID): Game setup received.")
+            // Create a mutable copy of the repair points from setup.
+            knownOpenRepairPoints = gameSetupInfo.repairPoints.toMutableList()
+            log.info("RepairAgent ($repairID): Game setup received. Storing ${knownOpenRepairPoints.size} repair points.")
         }
 
         on<CurrentPosition> { message ->
-            if (!isSubscribed && setup != null) {
-                log.info("RepairAgent ($repairID): Subscribing to $BROADCAST_TOPIC on first turn.")
+            val gameTurn = message.gameTurn
+            currentPosition = message.position
+
+            if (setup == null) { return@on }
+
+            if (!isSubscribed) {
+                log.info("RepairAgent ($repairID): Subscribing to $BROADCAST_TOPIC on turn $gameTurn.")
                 msgBroker subscribe self to BROADCAST_TOPIC
                 isSubscribed = true
             }
-
-            if (setup == null || busy) {
-                if (busy) log.debug("RepairAgent ($repairID): Busy, skipping turn.")
+            if (busy) {
                 return@on
             }
             busy = true
-            currentPosition = message.position
 
+            // PRIORITY 1: Request material transfer if arrived last turn
+            if (arrivedForTransferWaitingNextTurn) {
+                requestTransferFromServer(gameTurn)
+                return@on
+            }
+
+            // PRIORITY 2: Request DROP if arrived at repair point last turn
+            if (arrivedAtRepairPointWaitingNextTurn) {
+                requestDropMaterial(gameTurn)
+                return@on
+            }
+
+            // PRIORITY 3: Continue moving
             if (currentPath.isNotEmpty()) {
-                moveAlongPath()
-            } else if (hasMaterial) {
-                goToRepairPoint()
-            } else {
+                moveAlongPath(gameTurn)
+            }
+            // PRIORITY 4: Plan path to repair point if holding material
+            else if (hasMaterial) {
+                goToRepairPoint(gameTurn)
+            }
+            // PRIORITY 5: Idle
+            else {
                 busy = false
             }
         }
 
         listen<CallForProposals>(BROADCAST_TOPIC) { cfp ->
-            log.error("!!!!!!!! REPAIR AGENT ($repairID) LISTENED to CallForProposals on $BROADCAST_TOPIC - CFP ID: ${cfp.conversationId}, From: ${cfp.collectorId}, MaterialAt: ${cfp.materialPosition} !!!!!!!!")
-
-            if (setup == null) {
-                log.error("RepairAgent ($repairID): Setup is NULL. Cannot process CFP for ${cfp.conversationId}.")
-                return@listen
-            }
-            if (currentPosition == null) {
-                log.error("RepairAgent ($repairID): CurrentPosition is NULL. Cannot process CFP for ${cfp.conversationId}.")
-                return@listen
-            }
-            val currentPos = currentPosition!!
-
-            log.info("RepairAgent ($repairID): Processing CFP ${cfp.conversationId} via LISTEN. Current state: activeCNP='${activeConversationId}', hasMaterial=$hasMaterial")
+            val currentSetup = setup
+            val currentPos = currentPosition
+            if (currentSetup == null || currentPos == null) { return@listen }
 
             if (activeConversationId == null && !hasMaterial) {
-                log.info("RepairAgent ($repairID): Conditions met for CNP ${cfp.conversationId}. Calculating path from $currentPos to ${cfp.materialPosition}.")
-                val path = Pathfinder.findPath(currentPos, cfp.materialPosition, setup!!.obstacles, setup!!.size)
-                val bid = path?.size ?: Int.MAX_VALUE
-
-                log.info("RepairAgent ($repairID): Path to material for CNP ${cfp.conversationId} cost: $bid (Path null: ${path == null})")
-
-                if (bid != Int.MAX_VALUE) {
+                Pathfinder.findPath(currentPos, cfp.materialPosition, currentSetup.obstacles, currentSetup.size)?.let { path ->
+                    val bid = path.size
                     activeConversationId = cfp.conversationId
                     cnpPartnerId = cfp.collectorId
-                    val proposal = Propose(repairID, bid, activeConversationId!!)
-                    log.info("RepairAgent ($repairID): Sending Propose with bid $bid for CNP ${activeConversationId!!} to ${cnpPartnerId!!}.")
-                    system.resolve(cnpPartnerId!!) tell proposal
-                } else {
-                    log.warn("RepairAgent ($repairID): Bid is Int.MAX_VALUE. Not sending proposal for CNP ${cfp.conversationId}.")
+                    system.resolve(cnpPartnerId!!) tell Propose(repairID, bid, activeConversationId!!)
+                    log.info("RepairAgent ($repairID): Sent proposal for CNP ${cfp.conversationId} with bid $bid.")
+                } ?: log.warn("RepairAgent ($repairID): No path found for CNP ${cfp.conversationId}, not bidding.")
+            }
+        }
+
+        // ***** NEW HANDLER *****
+        // Listen for broadcasts from other RepairAgents about completed repairs
+        listen<RepairPointCompleted>(BROADCAST_TOPIC) { completedMsg ->
+            if (knownOpenRepairPoints.contains(completedMsg.position)) {
+                log.info("RepairAgent ($repairID): Received broadcast that ${completedMsg.position} has been repaired. Removing from my list.")
+                knownOpenRepairPoints.remove(completedMsg.position)
+
+                // Optional: If our current path was leading to this now-repaired point, we must change course.
+                val lastPointInPath = currentPath.lastOrNull()?.let { currentPosition?.applyMove(it, setup!!.size) }
+                if (currentPath.isNotEmpty() && lastPointInPath == completedMsg.position) {
+                    log.warn("RepairAgent ($repairID): My current path was to the now-repaired point ${completedMsg.position}. Stopping and replanning.")
+                    currentPath.clear()
+                    // The main on<CurrentPosition> loop will call goToRepairPoint() again next turn to find a new destination.
                 }
-            } else {
-                log.warn("RepairAgent ($repairID): Conditions NOT met to consider bidding for CNP ${cfp.conversationId}. Current activeCNP='${activeConversationId}', hasMaterial=$hasMaterial")
             }
         }
 
         on<AcceptProposal> { acceptance ->
             if (acceptance.conversationId == activeConversationId) {
-                log.info("RepairAgent ($repairID): Proposal for CNP ${acceptance.conversationId} ACCEPTED! Moving to meet ${cnpPartnerId ?: "UNKNOWN PARTNER"} at ${acceptance.meetingPosition}.")
-                val currentPos = currentPosition ?: run {
-                    log.error("RepairAgent ($repairID): CurrentPosition is null on AcceptProposal for ${acceptance.conversationId}. Aborting.")
-                    activeConversationId = null; cnpPartnerId = null
+                log.info("RepairAgent ($repairID): Proposal for CNP ${acceptance.conversationId} ACCEPTED! Moving to meet at ${acceptance.meetingPosition}.")
+                meetingPositionForTransfer = acceptance.meetingPosition
+                val currentPos = currentPosition ?: return@on
+                val gameSetup = setup ?: return@on
+
+                if (currentPos == meetingPositionForTransfer) {
+                    arrivedForTransferWaitingNextTurn = true
                     busy = false
-                    return@on
-                }
-                val gameSetup = setup ?: run {
-                    log.error("RepairAgent ($repairID): Setup is null on AcceptProposal for ${acceptance.conversationId}. Aborting.")
-                    activeConversationId = null; cnpPartnerId = null
-                    busy = false
-                    return@on
-                }
-                Pathfinder.findPath(currentPos, acceptance.meetingPosition, gameSetup.obstacles, gameSetup.size)?.let { path ->
-                    currentPath = path
-                    if (currentPath.isEmpty() && currentPos == acceptance.meetingPosition) {
-                        log.info("RepairAgent ($repairID): Already at meeting point ${acceptance.meetingPosition} for CNP ${acceptance.conversationId}.")
-                        handleArrival() // Will set busy=false
-                    } else if (currentPath.isEmpty()) {
-                        log.warn("RepairAgent ($repairID): Path to meeting point ${acceptance.meetingPosition} is empty but not at destination for CNP ${acceptance.conversationId}. Resetting.")
-                        activeConversationId = null; cnpPartnerId = null; busy = false
-                    }
-                } ?: run {
-                    log.warn("RepairAgent ($repairID): Could not find path to meeting point ${acceptance.meetingPosition} for CNP ${acceptance.conversationId}. Resetting.")
-                    activeConversationId = null; cnpPartnerId = null
+                } else {
+                    Pathfinder.findPath(currentPos, meetingPositionForTransfer!!, gameSetup.obstacles, gameSetup.size)?.let { currentPath = it }
                     busy = false
                 }
-            } else {
-                log.warn("RepairAgent ($repairID): Received AcceptProposal for wrong/old CNP: ${acceptance.conversationId} (expected ${activeConversationId})")
             }
         }
 
         on<RejectProposal> { rejection ->
             if (rejection.conversationId == activeConversationId) {
-                log.info("RepairAgent ($repairID): Proposal for CNP ${activeConversationId} REJECTED. Back to idle.")
+                log.info("RepairAgent ($repairID): Proposal for CNP ${activeConversationId} REJECTED.")
                 activeConversationId = null
                 cnpPartnerId = null
-            } else {
-                log.warn("RepairAgent ($repairID): Received RejectProposal for wrong/old CNP: ${rejection.conversationId} (expected ${activeConversationId})")
+                meetingPositionForTransfer = null
             }
         }
 
-        // Assuming TransferInform has at least `fromID: String`.
-        // The 'toID' is implicit (this agent is the recipient).
-        on<TransferInform> { informMessage -> // Renamed 'it' to 'informMessage' for clarity
-            println("STUPID FUCKIN LOSER")
-
-                log.info("RepairAgent ($repairID): Material transfer complete from ${informMessage.fromID} (related to CNP $activeConversationId).")
+        on<TransferInform> { informMessage ->
+            if (cnpPartnerId == informMessage.fromID && activeConversationId != null) {
+                log.info("RepairAgent ($repairID): Material transfer complete from ${informMessage.fromID} for CNP $activeConversationId.")
                 hasMaterial = true
-                currentPath.clear() // Clear any path to meeting point
-
-                // This CNP interaction (for getting material) is now fulfilled.
                 activeConversationId = null
                 cnpPartnerId = null
-
+                meetingPositionForTransfer = null
+                arrivedForTransferWaitingNextTurn = false
+            }
         }
     }
 
-    private fun moveAlongPath() {
-        if (currentPath.isEmpty()) {
-            handleArrival()
-            return
-        }
-
-        val action = currentPath.poll()
-        log.info("RepairAgent ($repairID): Moving with action: $action for CNP $activeConversationId. Path items remaining: ${currentPath.size}")
+    private fun moveAlongPath(gameTurn: Int) {
+        val action = currentPath.poll() ?: run { busy = false; return }
+        log.info("RepairAgent ($repairID): Turn $gameTurn. Moving with $action. Path left: ${currentPath.size}.")
         val server = system.resolve(SERVER_NAME) as? AgentRef<WorkerActionRequest>
-        server?.ask<WorkerActionRequest, WorkerActionResponse>(
-            WorkerActionRequest(repairID, action)
-        ) { response ->
-            if (response == null || (!response.state && response.flag != ActionFlag.MAX_ACTIONS)) {
-                log.warn("RepairAgent ($repairID): Move action $action failed for CNP $activeConversationId. Clearing path. Flag: ${response?.flag}")
-                currentPath.clear()
-                activeConversationId = null
-                cnpPartnerId = null
+        server?.ask<WorkerActionRequest, WorkerActionResponse>(WorkerActionRequest(repairID, action)) { response ->
+            if (response == null || !response.state) {
+
+                if (response == null || !response.state) {
+                    log.warn("RepairAgent ($repairID): Move action $action failed. Flag: ${response?.flag}. Clearing path and CNP state.")
+                    currentPath.clear()
+                    if (!hasMaterial) {
+                        activeConversationId = null; cnpPartnerId = null; meetingPositionForTransfer = null
+                    }
+                }
             }
 
             if (currentPath.isEmpty()) {
-                log.info("RepairAgent ($repairID): Path is now empty after move for CNP $activeConversationId, handling arrival.")
-                handleArrival()
-            } else {
-                busy = false
+                log.info("RepairAgent ($repairID): Path is now empty after move.")
+                if (!hasMaterial) {
+                    arrivedForTransferWaitingNextTurn = true
+                } else {
+                    arrivedAtRepairPointWaitingNextTurn = true
+                }
             }
-        } ?: run {
-            log.error("RepairAgent ($repairID): Server not found for WorkerActionRequest during move for CNP $activeConversationId.")
-            currentPath.clear()
-            activeConversationId = null; cnpPartnerId = null
             busy = false
         }
     }
 
-    private fun handleArrival() {
-        log.info("RepairAgent ($repairID): handleArrival called. HasMaterial: $hasMaterial, ActiveCNP: $activeConversationId, Partner: $cnpPartnerId")
+    private fun requestTransferFromServer(gameTurn: Int) {
+        log.info("RepairAgent ($repairID): Turn $gameTurn. Requesting material transfer from $cnpPartnerId.")
+        system.resolve(SERVER_NAME) tell TransferMaterial(cnpPartnerId!!, repairID)
+        arrivedForTransferWaitingNextTurn = false
+        busy = false
+    }
+
+    private fun requestDropMaterial(gameTurn: Int) {
+        log.info("RepairAgent ($repairID): Turn $gameTurn. Requesting DROP at $currentPosition.")
+        arrivedAtRepairPointWaitingNextTurn = false
+        val positionOfDropAttempt = currentPosition
         val server = system.resolve(SERVER_NAME) as? AgentRef<WorkerActionRequest>
-        if (server == null) {
-            log.error("RepairAgent ($repairID): Server not found for handleArrival action (CNP $activeConversationId).")
+        server?.ask<WorkerActionRequest, WorkerActionResponse>(
+            WorkerActionRequest(repairID, WorkerAction.DROP)
+        ) { responseDrop ->
+        if (positionOfDropAttempt == null) {
+            log.error("RepairAgent ($repairID): Cannot DROP, currentPosition is null.")
+            busy = false
+            return@ask
+        }
+
+            if (responseDrop != null && responseDrop.state) {
+                log.info("RepairAgent ($repairID): DROP successful at $positionOfDropAttempt.")
+                hasMaterial = false
+                knownOpenRepairPoints.remove(positionOfDropAttempt) // Remove from our own list
+
+                // ***** NEW LOGIC: BROADCAST THE SUCCESS *****
+                log.info("RepairAgent ($repairID): Broadcasting RepairPointCompleted at $positionOfDropAttempt.")
+                msgBroker.publish(BROADCAST_TOPIC, RepairPointCompleted(positionOfDropAttempt))
+
+            } else {
+                log.warn("RepairAgent ($repairID): DROP failed at $positionOfDropAttempt. Flag: ${responseDrop?.flag}")
+                if (responseDrop?.flag == ActionFlag.NO_REPAIRPOINT) {
+                    log.error("RepairAgent ($repairID): Updating knowledge: $positionOfDropAttempt is not an open repair point. Removing from list.")
+                    knownOpenRepairPoints.remove(positionOfDropAttempt)
+                }
+            }
+            busy = false
+        }
+    }
+
+    private fun goToRepairPoint(gameTurn: Int) {
+        log.info("RepairAgent ($repairID): Turn $gameTurn. Finding path to a repair point from ${knownOpenRepairPoints.size} known points.")
+        val currentPos = currentPosition ?: run { log.error("RepairAgent ($repairID): CurrentPosition is null."); busy = false; return }
+        val gameSetup = setup ?: run { log.error("RepairAgent ($repairID): Setup is null."); busy = false; return }
+
+        if (knownOpenRepairPoints.isEmpty()) {
+            log.warn("RepairAgent ($repairID): No known open repair points left. Idling with material.")
             busy = false
             return
         }
 
-        // The primary condition is now based on whether the agent has a partner for a material exchange.
-// This is a more reliable indicator of being at a "meeting point" vs. a "repair point".
-        if (cnpPartnerId != null && activeConversationId != null) {
-            log.info("RepairAgent ($repairID): Arrived at meeting point for CNP $activeConversationId. Requesting material transfer from $cnpPartnerId.")
-
-            // A sanity check to ensure we don't already have material.
-            if (!hasMaterial) {
-                println("Requesting material handoff from partner: $cnpPartnerId.")
-                println("halllllll")
-
-                system.resolve(SERVER_NAME) tell TransferMaterial(cnpPartnerId!!, repairID)
-            } else {
-                log.warn("RepairAgent ($repairID): Arrived at meeting point but already have material! Aborting transfer.")
-            }
-            busy = false
-        } else {
-            // If there's no transfer partner, we must be at the final repair destination.
-            log.info("RepairAgent ($repairID): Arrived at a repair point.")
-
-            // Here, we check if we have the material needed to perform the repair.
-            if (hasMaterial) {
-                log.info("RepairAgent ($repairID): Has material. Dropping material to start repair.")
-                server.ask<WorkerActionRequest, WorkerActionResponse>(
-                    WorkerActionRequest(repairID, WorkerAction.DROP)
-                ) { responseDrop ->
-                    if (responseDrop.state) {
-                        log.info("RepairAgent ($repairID): DROP successful.")
-                        hasMaterial = false
-                    } else {
-                        log.warn("RepairAgent ($repairID): DROP failed. Flag: ${responseDrop.flag}")
-                    }
-                    busy = false
-                }
-            } else {
-                // Handles the error case where the agent arrives at the repair point without any material.
-                log.warn("RepairAgent ($repairID): Arrived at repair point but has NO material! Cannot work.")
-                busy = false
-            }
+        val closestRepairPoint = knownOpenRepairPoints.minByOrNull {
+            Pathfinder.findPath(currentPos, it, gameSetup.obstacles, gameSetup.size)?.size ?: Int.MAX_VALUE
         }
-    }
-
-    private fun goToRepairPoint() {
-        log.info("RepairAgent ($repairID): goToRepairPoint called (has material).")
-        val currentPos = currentPosition ?: run {
-            log.error("RepairAgent ($repairID): CurrentPosition is null in goToRepairPoint.")
-            busy = false; return
-        }
-        val gameSetup = setup ?: run {
-            log.error("RepairAgent ($repairID): Setup is null in goToRepairPoint.")
-            busy = false; return
-        }
-
-        // Agent relies on its initial setup.repairPoints.
-        // Server validates the DROP action.
-        val closestRepairPoint = gameSetup.repairPoints
-            .filter { repairP -> repairP.x != -1 && repairP.y != -1 } // Basic validity check from setup
-            .minByOrNull { p ->
-                Pathfinder.findPath(currentPos, p, gameSetup.obstacles, gameSetup.size)?.size ?: Int.MAX_VALUE
-            }
 
         if (closestRepairPoint != null) {
-            log.info("RepairAgent ($repairID): Found closest (known) repair point at $closestRepairPoint. Calculating path.")
-            Pathfinder.findPath(currentPos, closestRepairPoint, gameSetup.obstacles, gameSetup.size)?.let { path ->
-                currentPath = path
-                if (currentPath.isNotEmpty()) {
-                    log.info("RepairAgent ($repairID): Path to repair point $closestRepairPoint calculated. Size: ${currentPath.size}")
-                } else {
-                    log.warn("RepairAgent ($repairID): Path to repair point $closestRepairPoint was empty, though it was selected.")
-                }
-            } ?: log.warn("RepairAgent ($repairID): Could not find path to repair point $closestRepairPoint even after selecting it.")
+            if (currentPos == closestRepairPoint) {
+                log.info("RepairAgent ($repairID): Already at repair point $closestRepairPoint. Setting flag to DROP next turn.")
+                arrivedAtRepairPointWaitingNextTurn = true
+            } else {
+                Pathfinder.findPath(currentPos, closestRepairPoint, gameSetup.obstacles, gameSetup.size)?.let {
+                    currentPath = it
+                    log.info("RepairAgent ($repairID): Path to repair point $closestRepairPoint calculated (${currentPath.size} steps).")
+                } ?: log.warn("RepairAgent ($repairID): Could not find path to $closestRepairPoint.")
+            }
         } else {
-            log.warn("RepairAgent ($repairID): No (known) active repair points found or reachable from setup info.")
+            log.warn("RepairAgent ($repairID): No reachable repair points found.")
         }
-
-        if (currentPath.isNotEmpty()) {
-            moveAlongPath()
-        } else {
-            log.warn("RepairAgent ($repairID): No path to any repair point. Remaining idle with material.")
-            busy = false
-        }
+        busy = false
     }
 }

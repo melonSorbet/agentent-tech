@@ -33,3 +33,5 @@ data class Propose(
 data class AcceptProposal(val meetingPosition: Position, val conversationId: String) : Serializable
 
 data class RejectProposal(val conversationId: String) : Serializable
+
+data class RepairPointCompleted(val position: Position) : Serializable

@@ -28,6 +28,7 @@ class CollectAgent(private val collectID: String) : Agent(overrideName = collect
 
     override fun behaviour() = act {
         on<GameSetupInfo> {
+
             setup = it
             log.info("CollectAgent ($collectID): Game setup received. Attempting to subscribe to BROADCAST_TOPIC.") // Added for consistency
             msgBroker subscribe self to BROADCAST_TOPIC
