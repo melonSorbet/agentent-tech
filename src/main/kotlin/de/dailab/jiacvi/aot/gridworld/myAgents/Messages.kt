@@ -35,3 +35,5 @@ data class AcceptProposal(val meetingPosition: Position, val conversationId: Str
 data class RejectProposal(val conversationId: String) : Serializable
 
 data class RepairPointCompleted(val position: Position) : Serializable
+
+data class HandoffComplete(val conversationId: String?) : java.io.Serializable

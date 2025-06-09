@@ -179,6 +179,7 @@ class RepairAgent(private val repairID: String) : Agent(overrideName = repairID)
     private fun requestTransferFromServer(gameTurn: Int) {
         log.info("RepairAgent ($repairID): Turn $gameTurn. Requesting material transfer from $cnpPartnerId.")
         system.resolve(SERVER_NAME) tell TransferMaterial(cnpPartnerId!!, repairID)
+        system.resolve(cnpPartnerId!!) tell HandoffComplete(activeConversationId)
         arrivedForTransferWaitingNextTurn = false
         busy = false
     }
